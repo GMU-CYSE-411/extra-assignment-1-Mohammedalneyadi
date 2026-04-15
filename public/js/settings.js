@@ -1,3 +1,17 @@
+function renderPreview(settings) {
+  const preview = document.getElementById("status-preview");
+
+  const name = document.createElement("strong");
+  name.textContent = settings.displayName;
+
+  const spacer = document.createElement("br");
+
+  const status = document.createElement("span");
+  status.textContent = settings.statusMessage;
+
+  preview.replaceChildren(name, spacer, status);
+}
+
 async function loadSettings(userId) {
   const result = await api(`/api/settings?userId=${encodeURIComponent(userId)}`);
   const settings = result.settings;
@@ -10,11 +24,8 @@ async function loadSettings(userId) {
   form.elements.theme.value = settings.theme;
   form.elements.statusMessage.value = settings.statusMessage;
   form.elements.emailOptIn.checked = Boolean(settings.emailOptIn);
-  document.getElementById("status-preview").innerHTML = `
-    <p><strong>${settings.displayName}</strong></p>
-    <p>${settings.statusMessage}</p>
-  `;
 
+  renderPreview(settings);
   writeJson("settings-output", settings);
 }
 
@@ -61,11 +72,17 @@ document.getElementById("settings-form").addEventListener("submit", async (event
 });
 
 document.getElementById("enable-email").addEventListener("click", async () => {
-  const result = await api("/api/settings/toggle-email?enabled=1");
+  const result = await api("/api/settings/toggle-email", {
+    method: "POST",
+    body: JSON.stringify({ enabled: 1 })
+  });
   writeJson("settings-output", result);
 });
 
 document.getElementById("disable-email").addEventListener("click", async () => {
-  const result = await api("/api/settings/toggle-email?enabled=0");
+  const result = await api("/api/settings/toggle-email", {
+    method: "POST",
+    body: JSON.stringify({ enabled: 0 })
+  });
   writeJson("settings-output", result);
 });
