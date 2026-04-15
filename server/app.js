@@ -1,5 +1,6 @@
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const express = require("express");
 const cookieParser = require("cookie-parser");
 const { DEFAULT_DB_FILE, openDatabase } = require("../db");
@@ -8,15 +9,24 @@ function sendPublicFile(response, fileName) {
   response.sendFile(path.join(__dirname, "..", "public", fileName));
 }
 
-function createSessionId() {
-  return `SESSION-${Math.random().toString(36).slice(2, 10)}-${Date.now()}`;
+function randomToken(size = 32) {
+  return crypto.randomBytes(size).toString("hex");
+}
+
+function sameOrigin(request) {
+  const origin = request.get("origin");
+  if (!origin) {
+    return false;
+  }
+
+  const host = request.get("host");
+  return origin === `${request.protocol}://${host}`;
 }
 
 async function createApp() {
   if (!fs.existsSync(DEFAULT_DB_FILE)) {
-    throw new Error(
-      `Database file not found at ${DEFAULT_DB_FILE}. Run "npm run init-db" first.`
-    );
+    throw new Error(`Database file not found at ${DEFAULT_DB_FILE}.
+Run "npm run init-db" first.`);
   }
 
   const db = openDatabase(DEFAULT_DB_FILE);
@@ -25,44 +35,51 @@ async function createApp() {
   app.use(express.json());
   app.use(express.urlencoded({ extended: false }));
   app.use(cookieParser());
+
   app.use("/css", express.static(path.join(__dirname, "..", "public", "css")));
   app.use("/js", express.static(path.join(__dirname, "..", "public", "js")));
 
   app.use(async (request, response, next) => {
-    const sessionId = request.cookies.sid;
+    try {
+      const sessionId = request.cookies.sid;
 
-    if (!sessionId) {
-      request.currentUser = null;
+      if (!sessionId) {
+        request.currentUser = null;
+        next();
+        return;
+      }
+
+      const row = await db.get(
+        `
+          SELECT
+            sessions.id AS session_id,
+            sessions.csrf_token AS csrf_token,
+            users.id AS id,
+            users.username AS username,
+            users.role AS role,
+            users.display_name AS display_name
+          FROM sessions
+          JOIN users ON users.id = sessions.user_id
+          WHERE sessions.id = ?
+        `,
+        [sessionId]
+      );
+
+      request.currentUser = row
+        ? {
+            sessionId: row.session_id,
+            csrfToken: row.csrf_token,
+            id: row.id,
+            username: row.username,
+            role: row.role,
+            displayName: row.display_name
+          }
+        : null;
+
       next();
-      return;
+    } catch (error) {
+      next(error);
     }
-
-    const row = await db.get(
-      `
-        SELECT
-          sessions.id AS session_id,
-          users.id AS id,
-          users.username AS username,
-          users.role AS role,
-          users.display_name AS display_name
-        FROM sessions
-        JOIN users ON users.id = sessions.user_id
-        WHERE sessions.id = ?
-      `,
-      [sessionId]
-    );
-
-    request.currentUser = row
-      ? {
-          sessionId: row.session_id,
-          id: row.id,
-          username: row.username,
-          role: row.role,
-          displayName: row.display_name
-        }
-      : null;
-
-    next();
   });
 
   function requireAuth(request, response, next) {
@@ -70,45 +87,107 @@ async function createApp() {
       response.status(401).json({ error: "Authentication required." });
       return;
     }
+    next();
+  }
+
+  function requireAdmin(request, response, next) {
+    if (!request.currentUser) {
+      response.status(401).json({ error: "Authentication required." });
+      return;
+    }
+
+    if (request.currentUser.role !== "admin") {
+      response.status(403).json({ error: "Admin access required." });
+      return;
+    }
 
     next();
   }
 
+  function requireCsrf(request, response, next) {
+    if (!request.currentUser) {
+      response.status(401).json({ error: "Authentication required." });
+      return;
+    }
+
+    if (!sameOrigin(request)) {
+      response.status(403).json({ error: "Invalid request origin." });
+      return;
+    }
+
+    const token = request.get("x-csrf-token");
+    if (!token || token !== request.currentUser.csrfToken) {
+      response.status(403).json({ error: "Invalid CSRF token." });
+      return;
+    }
+
+    next();
+  }
+
+  function getTargetUserId(request, fieldName = "userId") {
+    if (request.currentUser.role === "admin") {
+      const raw = request.method === "GET" ? request.query[fieldName] : request.body[fieldName];
+      const parsed = Number(raw);
+      return Number.isInteger(parsed) && parsed > 0 ? parsed : request.currentUser.id;
+    }
+
+    return request.currentUser.id;
+  }
+
   app.get("/", (_request, response) => sendPublicFile(response, "index.html"));
   app.get("/login", (_request, response) => sendPublicFile(response, "login.html"));
-  app.get("/notes", (_request, response) => sendPublicFile(response, "notes.html"));
-  app.get("/settings", (_request, response) => sendPublicFile(response, "settings.html"));
-  app.get("/admin", (_request, response) => sendPublicFile(response, "admin.html"));
+  app.get("/notes", requireAuth, (_request, response) => sendPublicFile(response, "notes.html"));
+  app.get("/settings", requireAuth, (_request, response) => sendPublicFile(response, "settings.html"));
+  app.get("/admin", requireAdmin, (_request, response) => sendPublicFile(response, "admin.html"));
 
   app.get("/api/me", (request, response) => {
-    response.json({ user: request.currentUser });
+    response.json({
+      user: request.currentUser
+        ? {
+            id: request.currentUser.id,
+            username: request.currentUser.username,
+            role: request.currentUser.role,
+            displayName: request.currentUser.displayName
+          }
+        : null,
+      csrfToken: request.currentUser ? request.currentUser.csrfToken : null
+    });
   });
 
   app.post("/api/login", async (request, response) => {
     const username = String(request.body.username || "");
     const password = String(request.body.password || "");
 
-    const query = `
-      SELECT id, username, role, display_name
-      FROM users
-      WHERE username = '${username}' AND password = '${password}'
-    `;
-    const user = await db.get(query);
+    const user = await db.get(
+      `
+        SELECT id, username, role, display_name
+        FROM users
+        WHERE username = ? AND password = ?
+      `,
+      [username, password]
+    );
 
     if (!user) {
       response.status(401).json({ error: "Invalid username or password." });
       return;
     }
 
-    const sessionId = request.cookies.sid || createSessionId();
+    if (request.cookies.sid) {
+      await db.run("DELETE FROM sessions WHERE id = ?", [request.cookies.sid]);
+    }
 
-    await db.run("DELETE FROM sessions WHERE id = ?", [sessionId]);
+    const sessionId = randomToken(24);
+    const csrfToken = randomToken(24);
+
     await db.run(
-      "INSERT INTO sessions (id, user_id, created_at) VALUES (?, ?, ?)",
-      [sessionId, user.id, new Date().toISOString()]
+      "INSERT INTO sessions (id, user_id, csrf_token, created_at) VALUES (?, ?, ?, ?)",
+      [sessionId, user.id, csrfToken, new Date().toISOString()]
     );
 
     response.cookie("sid", sessionId, {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: false,
       path: "/"
     });
 
@@ -123,57 +202,66 @@ async function createApp() {
     });
   });
 
-  app.post("/api/logout", async (request, response) => {
-    if (request.cookies.sid) {
-      await db.run("DELETE FROM sessions WHERE id = ?", [request.cookies.sid]);
-    }
+  app.post("/api/logout", requireAuth, requireCsrf, async (request, response) => {
+    await db.run("DELETE FROM sessions WHERE id = ?", [request.currentUser.sessionId]);
 
-    response.clearCookie("sid");
+    response.clearCookie("sid", {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: false,
+      path: "/"
+    });
+
     response.json({ ok: true });
   });
 
   app.get("/api/notes", requireAuth, async (request, response) => {
-    const ownerId = request.query.ownerId || request.currentUser.id;
-    const search = request.query.search || "";
+    const ownerId = getTargetUserId(request, "ownerId");
+    const search = `%${String(request.query.search || "")}%`;
 
-    const notes = await db.all(`
-      SELECT
-        notes.id,
-        notes.owner_id AS ownerId,
-        users.username AS ownerUsername,
-        notes.title,
-        notes.body,
-        notes.pinned,
-        notes.created_at AS createdAt
-      FROM notes
-      JOIN users ON users.id = notes.owner_id
-      WHERE notes.owner_id = ${ownerId}
-        AND (notes.title LIKE '%${search}%' OR notes.body LIKE '%${search}%')
-      ORDER BY notes.pinned DESC, notes.id DESC
-    `);
+    const notes = await db.all(
+      `
+        SELECT
+          notes.id,
+          notes.owner_id AS ownerId,
+          users.username AS ownerUsername,
+          notes.title,
+          notes.body,
+          notes.pinned,
+          notes.created_at AS createdAt
+        FROM notes
+        JOIN users ON users.id = notes.owner_id
+        WHERE notes.owner_id = ?
+          AND (notes.title LIKE ? OR notes.body LIKE ?)
+        ORDER BY notes.pinned DESC, notes.id DESC
+      `,
+      [ownerId, search, search]
+    );
 
     response.json({ notes });
   });
 
-  app.post("/api/notes", requireAuth, async (request, response) => {
-    const ownerId = Number(request.body.ownerId || request.currentUser.id);
-    const title = String(request.body.title || "");
-    const body = String(request.body.body || "");
+  app.post("/api/notes", requireAuth, requireCsrf, async (request, response) => {
+    const ownerId = getTargetUserId(request, "ownerId");
+    const title = String(request.body.title || "").trim();
+    const body = String(request.body.body || "").trim();
     const pinned = request.body.pinned ? 1 : 0;
+
+    if (!title) {
+      response.status(400).json({ error: "Title is required." });
+      return;
+    }
 
     const result = await db.run(
       "INSERT INTO notes (owner_id, title, body, pinned, created_at) VALUES (?, ?, ?, ?, ?)",
       [ownerId, title, body, pinned, new Date().toISOString()]
     );
 
-    response.status(201).json({
-      ok: true,
-      noteId: result.lastID
-    });
+    response.status(201).json({ ok: true, noteId: result.lastID });
   });
 
   app.get("/api/settings", requireAuth, async (request, response) => {
-    const userId = Number(request.query.userId || request.currentUser.id);
+    const userId = getTargetUserId(request, "userId");
 
     const settings = await db.get(
       `
@@ -195,11 +283,12 @@ async function createApp() {
     response.json({ settings });
   });
 
-  app.post("/api/settings", requireAuth, async (request, response) => {
-    const userId = Number(request.body.userId || request.currentUser.id);
-    const displayName = String(request.body.displayName || "");
-    const statusMessage = String(request.body.statusMessage || "");
-    const theme = String(request.body.theme || "classic");
+  app.post("/api/settings", requireAuth, requireCsrf, async (request, response) => {
+    const userId = getTargetUserId(request, "userId");
+    const displayName = String(request.body.displayName || "").trim();
+    const statusMessage = String(request.body.statusMessage || "").trim();
+    const allowedThemes = new Set(["classic", "ocean", "forest"]);
+    const theme = allowedThemes.has(String(request.body.theme || "")) ? String(request.body.theme) : "classic";
     const emailOptIn = request.body.emailOptIn ? 1 : 0;
 
     await db.run("UPDATE users SET display_name = ? WHERE id = ?", [displayName, userId]);
@@ -211,8 +300,8 @@ async function createApp() {
     response.json({ ok: true });
   });
 
-  app.get("/api/settings/toggle-email", requireAuth, async (request, response) => {
-    const enabled = request.query.enabled === "1" ? 1 : 0;
+  app.post("/api/settings/toggle-email", requireAuth, requireCsrf, async (request, response) => {
+    const enabled = request.body.enabled === 1 || request.body.enabled === "1" ? 1 : 0;
 
     await db.run("UPDATE settings SET email_opt_in = ? WHERE user_id = ?", [
       enabled,
@@ -226,19 +315,21 @@ async function createApp() {
     });
   });
 
-  app.get("/api/admin/users", requireAuth, async (_request, response) => {
-    const users = await db.all(`
-      SELECT
-        users.id,
-        users.username,
-        users.role,
-        users.display_name AS displayName,
-        COUNT(notes.id) AS noteCount
-      FROM users
-      LEFT JOIN notes ON notes.owner_id = users.id
-      GROUP BY users.id, users.username, users.role, users.display_name
-      ORDER BY users.id
-    `);
+  app.get("/api/admin/users", requireAdmin, async (_request, response) => {
+    const users = await db.all(
+      `
+        SELECT
+          users.id,
+          users.username,
+          users.role,
+          users.display_name AS displayName,
+          COUNT(notes.id) AS noteCount
+        FROM users
+        LEFT JOIN notes ON notes.owner_id = users.id
+        GROUP BY users.id, users.username, users.role, users.display_name
+        ORDER BY users.id
+      `
+    );
 
     response.json({ users });
   });
@@ -246,6 +337,4 @@ async function createApp() {
   return app;
 }
 
-module.exports = {
-  createApp
-};
+module.exports = { createApp };
